@@ -259,6 +259,7 @@ enum FdwModifyPrivateIndex
 #define ADD_REL_QUALIFIER(buf, varno)	\
 		appendStringInfo((buf), "%s%d.", REL_ALIAS_PREFIX, (varno))
 
+#if (PG_VERSION_NUM >= 90300)
 static void deparseInsertSql(StringInfo buf, PlannerInfo *root,
 				 Index rtindex, Relation rel, List *targetAttrs);
 static void deparseRelation(StringInfo buf, Relation rel);
@@ -274,6 +275,8 @@ static void deparseTargetList(StringInfo buf,
 				  List **retrieved_attrs);
 static const char **convert_prep_stmt_params(struct SqliteFdwModifyState *fmstate,
 						 TupleTableSlot *slot);
+#endif
+
 static sqlite3 *GetConnection(Oid ftableId);
 static void ReleaseConnection(sqlite3* db);
 
@@ -727,7 +730,6 @@ sqliteIterateForeignScan(ForeignScanState *node)
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				errmsg("SQL error during prepare: %s", sqlite3_errmsg(festate->conn))
 				));
-			sqlite3_close(festate->conn);
 		}
 	}
 
@@ -790,7 +792,7 @@ sqliteEndForeignScan(ForeignScanState *node)
 
 	if (festate->conn)
 	{
-		sqlite3_close(festate->conn);
+		ReleaseConnection(festate->conn);
 		festate->conn = NULL;
 	}
 
@@ -908,11 +910,13 @@ sqlitePlanForeignModify(PlannerInfo *root,
 	if (plan->returningLists)
 		elog(ERROR, "RETURNING not supported");
 
+#if (PG_VERSION_NUM >= 90500)
 	/*
 	 * No ON CONFLICT specification please.
 	 */
 	if (plan->onConflictAction != ONCONFLICT_NONE)
 		elog(ERROR, "ON CONFLICT specification not supported");
+#endif
 
 	/*
 	 * Construct the SQL command string.
@@ -1084,12 +1088,9 @@ sqliteExecForeignInsert(EState *estate,
 	{
 		rc = sqlite3_prepare(fmstate->conn, fmstate->query, -1, &fmstate->stmt, &pzTail);
 		if (rc!=SQLITE_OK)
-		{
 			ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				errmsg("SQL error during prepare: %s", sqlite3_errmsg(fmstate->conn))));
-			sqlite3_close(fmstate->conn);
-		}
 	}
 
 	/* Bind using values of current input tuple */
@@ -1101,50 +1102,35 @@ sqliteExecForeignInsert(EState *estate,
 
 			rc = sqlite3_bind_text(fmstate->stmt, i+1, p_values[i], len, SQLITE_STATIC);
 			if (rc!=SQLITE_OK)
-			{
 				ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					errmsg("SQL error during bind: %s", sqlite3_errmsg(fmstate->conn))));
-				sqlite3_close(fmstate->conn);
-			}
 		}
 		else
 		{
 			rc = sqlite3_bind_null(fmstate->stmt, i+1);
 			if (rc!=SQLITE_OK)
-			{
 				ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					errmsg("SQL error during bind: %s", sqlite3_errmsg(fmstate->conn))));
-				sqlite3_close(fmstate->conn);
-			}
 		}
 	}
 
 	/* Get the result, and check for success. */
 	if (sqlite3_step(fmstate->stmt) != SQLITE_DONE)
-	{
 		ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					errmsg("SQL error during step: %s", sqlite3_errmsg(fmstate->conn))));
-				sqlite3_close(fmstate->conn);
-	}
 
 	if (sqlite3_clear_bindings(fmstate->stmt) != SQLITE_OK)
-	{
 		ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					errmsg("SQL error during clear bindings: %s", sqlite3_errmsg(fmstate->conn))));
-				sqlite3_close(fmstate->conn);
-	}
 
 	if (sqlite3_reset(fmstate->stmt) != SQLITE_OK)
-	{
 		ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					errmsg("SQL error during reset: %s", sqlite3_errmsg(fmstate->conn))));
-				sqlite3_close(fmstate->conn);
-	}
 
 	MemoryContextReset(fmstate->temp_cxt);
 
@@ -1258,79 +1244,7 @@ sqliteEndForeignModify(EState *estate,
 	ReleaseConnection(fmstate->conn);
 	fmstate->conn = NULL;
 }
-#endif
 
-
-static void
-sqliteExplainForeignScan(ForeignScanState *node,
-							struct ExplainState *es)
-{
-	/*
-	 * Print additional EXPLAIN output for a foreign table scan. This function
-	 * can call ExplainPropertyText and related functions to add fields to the
-	 * EXPLAIN output. The flag fields in es can be used to determine what to
-	 * print, and the state of the ForeignScanState node can be inspected to
-	 * provide run-time statistics in the EXPLAIN ANALYZE case.
-	 *
-	 * If the ExplainForeignScan pointer is set to NULL, no additional
-	 * information is printed during EXPLAIN.
-	 */
-	sqlite3                  *db;
-	sqlite3_stmt             *result;
-	char                     *query;
-    size_t                   len;
-    int                      rc;
-    const char  *pzTail;
-	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
-
-	elog(DEBUG1,"entering function %s",__func__);
-
-	/* Show the query (only if VERBOSE) */
-	if (es->verbose)
-	{
-		/* show query */
-		ExplainPropertyText("sqlite query", festate->query, es);
-	}
-
-	/* Connect to the server */
-	db = GetConnection(RelationGetRelid(node->ss.ss_currentRelation));
-
-	/* Build the query */
-    len = strlen(festate->query) + 20;
-    query = (char *)palloc(len);
-    snprintf(query, len, "EXPLAIN QUERY PLAN %s", festate->query);
-
-    /* Execute the query */
-	rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
-	if (rc!=SQLITE_OK) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
-
-	/* get the next record, if any, and fill in the slot */
-	while (sqlite3_step(result) == SQLITE_ROW)
-	{
-		/* I don't keep the three first columns;
-		   it could be a good idea to add that later */
-		//for (x = 0; x < sqlite3_column_count(festate->result); x++)
-		//{
-			ExplainPropertyText("sqlite plan", (char *) sqlite3_column_text(result, 3), es);
-		//}
-	}
-
-	// Free the query results
-	sqlite3_finalize(result);
-
-	// Close temporary connection
-	sqlite3_close(db);
-
-}
-
-
-#if (PG_VERSION_NUM >= 90300)
 static void
 sqliteExplainForeignModify(ModifyTableState *mtstate,
 							  ResultRelInfo *rinfo,
@@ -1352,148 +1266,6 @@ sqliteExplainForeignModify(ModifyTableState *mtstate,
 
 	elog(DEBUG1,"entering function %s",__func__);
 
-}
-#endif
-
-
-#if (PG_VERSION_NUM >= 90200)
-static bool
-sqliteAnalyzeForeignTable(Relation relation,
-							 AcquireSampleRowsFunc *func,
-							 BlockNumber *totalpages)
-{
-	/* ----
-	 * This function is called when ANALYZE is executed on a foreign table. If
-	 * the FDW can collect statistics for this foreign table, it should return
-	 * true, and provide a pointer to a function that will collect sample rows
-	 * from the table in func, plus the estimated size of the table in pages
-	 * in totalpages. Otherwise, return false.
-	 *
-	 * If the FDW does not support collecting statistics for any tables, the
-	 * AnalyzeForeignTable pointer can be set to NULL.
-	 *
-	 * If provided, the sample collection function must have the signature:
-	 *
-	 *	  int
-	 *	  AcquireSampleRowsFunc (Relation relation, int elevel,
-	 *							 HeapTuple *rows, int targrows,
-	 *							 double *totalrows,
-	 *							 double *totaldeadrows);
-	 *
-	 * A random sample of up to targrows rows should be collected from the
-	 * table and stored into the caller-provided rows array. The actual number
-	 * of rows collected must be returned. In addition, store estimates of the
-	 * total numbers of live and dead rows in the table into the output
-	 * parameters totalrows and totaldeadrows. (Set totaldeadrows to zero if
-	 * the FDW does not have any concept of dead rows.)
-	 * ----
-	 */
-
-	elog(DEBUG1,"entering function %s",__func__);
-
-	return false;
-}
-#endif
-
-static int
-GetEstimatedRows(Oid foreigntableid)
-{
-	sqlite3		   *db;
-	sqlite3_stmt   *result;
-	char		   *database;
-	char		   *table;
-	char		   *query;
-    size_t			len;
-    int				rc;
-    const char	   *pzTail;
-
-	int rows = 0;
-
-	sqliteGetOptions(foreigntableid, &database, &table);
-
-	/* Connect to the server */
-	db = GetConnection(foreigntableid);
-
-	/* Check that the sqlite_stat1 table exists */
-	rc = sqlite3_prepare(db, "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'", -1, &result, &pzTail);
-	if (rc!=SQLITE_OK) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
-	if (sqlite3_step(result) != SQLITE_ROW)
-	{
-		ereport(WARNING,
-			(errcode(ERRCODE_FDW_TABLE_NOT_FOUND),
-			errmsg("The sqlite3 database has not been analyzed."),
-			errhint("Run ANALYZE on table \"%s\", database \"%s\".", table, database)
-			));
-		rows = 10;
-	}
-
-	// Free the query results
-	sqlite3_finalize(result);
-
-	if (rows == 0)
-	{
-		/* Build the query */
-	    len = strlen(table) + 60;
-	    query = (char *)palloc(len);
-	    snprintf(query, len, "SELECT stat FROM sqlite_stat1 WHERE tbl='%s' AND idx IS NULL", table);
-	    elog(LOG, "query:%s", query);
-
-	    /* Execute the query */
-		rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
-		if (rc!=SQLITE_OK) {
-			ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
-				));
-			sqlite3_close(db);
-		}
-
-		/* get the next record, if any, and fill in the slot */
-		if (sqlite3_step(result) == SQLITE_ROW)
-		{
-			rows = sqlite3_column_int(result, 0);
-		}
-
-		// Free the query results
-		sqlite3_finalize(result);
-	}
-	else
-	{
-		/*
-		 * The sqlite database doesn't have any statistics.
-		 * There's not much we can do, except using a hardcoded one.
-		 * Using a foreign table option might be a better solution.
-		 */
-		rows = DEFAULT_ESTIMATED_LINES;
-	}
-
-	// Close temporary connection
-	sqlite3_close(db);
-
-	return rows;
-}
-
-static bool
-file_exists(const char *name)
-{
-    struct stat st;
-
-    AssertArg(name != NULL);
-
-    if (stat(name, &st) == 0)
-        return S_ISDIR(st.st_mode) ? false : true;
-    else if (!(errno == ENOENT || errno == ENOTDIR || errno == EACCES))
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("could not access file \"%s\": %m", name)));
-
-    return false;
 }
 
 /*
@@ -1855,6 +1627,210 @@ convert_prep_stmt_params(SqliteFdwModifyState *fmstate,
 
 	return p_values;
 }
+#endif
+
+
+static void
+sqliteExplainForeignScan(ForeignScanState *node,
+							struct ExplainState *es)
+{
+	/*
+	 * Print additional EXPLAIN output for a foreign table scan. This function
+	 * can call ExplainPropertyText and related functions to add fields to the
+	 * EXPLAIN output. The flag fields in es can be used to determine what to
+	 * print, and the state of the ForeignScanState node can be inspected to
+	 * provide run-time statistics in the EXPLAIN ANALYZE case.
+	 *
+	 * If the ExplainForeignScan pointer is set to NULL, no additional
+	 * information is printed during EXPLAIN.
+	 */
+	sqlite3                  *db;
+	sqlite3_stmt             *result;
+	char                     *query;
+    size_t                   len;
+    int                      rc;
+    const char  *pzTail;
+	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
+
+	elog(DEBUG1,"entering function %s",__func__);
+
+	/* Show the query (only if VERBOSE) */
+	if (es->verbose)
+	{
+		/* show query */
+		ExplainPropertyText("sqlite query", festate->query, es);
+	}
+
+	/* Connect to the server */
+	db = GetConnection(RelationGetRelid(node->ss.ss_currentRelation));
+
+	/* Build the query */
+    len = strlen(festate->query) + 20;
+    query = (char *)palloc(len);
+    snprintf(query, len, "EXPLAIN QUERY PLAN %s", festate->query);
+
+    /* Execute the query */
+	rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
+	if (rc!=SQLITE_OK)
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))));
+
+	/* get the next record, if any, and fill in the slot */
+	while (sqlite3_step(result) == SQLITE_ROW)
+	{
+		/* I don't keep the three first columns;
+		   it could be a good idea to add that later */
+		//for (x = 0; x < sqlite3_column_count(festate->result); x++)
+		//{
+			ExplainPropertyText("sqlite plan", (char *) sqlite3_column_text(result, 3), es);
+		//}
+	}
+
+	// Free the query results
+	sqlite3_finalize(result);
+
+	// Close temporary connection
+	ReleaseConnection(db);
+
+}
+
+#if (PG_VERSION_NUM >= 90200)
+static bool
+sqliteAnalyzeForeignTable(Relation relation,
+							 AcquireSampleRowsFunc *func,
+							 BlockNumber *totalpages)
+{
+	/* ----
+	 * This function is called when ANALYZE is executed on a foreign table. If
+	 * the FDW can collect statistics for this foreign table, it should return
+	 * true, and provide a pointer to a function that will collect sample rows
+	 * from the table in func, plus the estimated size of the table in pages
+	 * in totalpages. Otherwise, return false.
+	 *
+	 * If the FDW does not support collecting statistics for any tables, the
+	 * AnalyzeForeignTable pointer can be set to NULL.
+	 *
+	 * If provided, the sample collection function must have the signature:
+	 *
+	 *	  int
+	 *	  AcquireSampleRowsFunc (Relation relation, int elevel,
+	 *							 HeapTuple *rows, int targrows,
+	 *							 double *totalrows,
+	 *							 double *totaldeadrows);
+	 *
+	 * A random sample of up to targrows rows should be collected from the
+	 * table and stored into the caller-provided rows array. The actual number
+	 * of rows collected must be returned. In addition, store estimates of the
+	 * total numbers of live and dead rows in the table into the output
+	 * parameters totalrows and totaldeadrows. (Set totaldeadrows to zero if
+	 * the FDW does not have any concept of dead rows.)
+	 * ----
+	 */
+
+	elog(DEBUG1,"entering function %s",__func__);
+
+	return false;
+}
+#endif
+
+static int
+GetEstimatedRows(Oid foreigntableid)
+{
+	sqlite3		   *db;
+	sqlite3_stmt   *result;
+	char		   *database;
+	char		   *table;
+	char		   *query;
+    size_t			len;
+    int				rc;
+    const char	   *pzTail;
+
+	int rows = 0;
+
+	sqliteGetOptions(foreigntableid, &database, &table);
+
+	/* Connect to the server */
+	db = GetConnection(foreigntableid);
+
+	/* Check that the sqlite_stat1 table exists */
+	rc = sqlite3_prepare(db, "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'", -1, &result, &pzTail);
+	if (rc!=SQLITE_OK)
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
+			));
+
+	if (sqlite3_step(result) != SQLITE_ROW)
+	{
+		ereport(WARNING,
+			(errcode(ERRCODE_FDW_TABLE_NOT_FOUND),
+			errmsg("The sqlite3 database has not been analyzed."),
+			errhint("Run ANALYZE on table \"%s\", database \"%s\".", table, database)
+			));
+		rows = 10;
+	}
+
+	// Free the query results
+	sqlite3_finalize(result);
+
+	if (rows == 0)
+	{
+		/* Build the query */
+	    len = strlen(table) + 60;
+	    query = (char *)palloc(len);
+	    snprintf(query, len, "SELECT stat FROM sqlite_stat1 WHERE tbl='%s' AND idx IS NULL", table);
+	    elog(LOG, "query:%s", query);
+
+	    /* Execute the query */
+		rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
+		if (rc!=SQLITE_OK)
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
+				));
+
+		/* get the next record, if any, and fill in the slot */
+		if (sqlite3_step(result) == SQLITE_ROW)
+		{
+			rows = sqlite3_column_int(result, 0);
+		}
+
+		// Free the query results
+		sqlite3_finalize(result);
+	}
+	else
+	{
+		/*
+		 * The sqlite database doesn't have any statistics.
+		 * There's not much we can do, except using a hardcoded one.
+		 * Using a foreign table option might be a better solution.
+		 */
+		rows = DEFAULT_ESTIMATED_LINES;
+	}
+
+	// Close temporary connection
+	ReleaseConnection(db);
+
+	return rows;
+}
+
+static bool
+file_exists(const char *name)
+{
+    struct stat st;
+
+    AssertArg(name != NULL);
+
+    if (stat(name, &st) == 0)
+        return S_ISDIR(st.st_mode) ? false : true;
+    else if (!(errno == ENOENT || errno == ENOTDIR || errno == EACCES))
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("could not access file \"%s\": %m", name)));
+
+    return false;
+}
 
 /*
  * Connection cache (inited on the first use)
@@ -1881,21 +1857,15 @@ do_sql_command(sqlite3 *db, const char *sql)
 
 	rc = sqlite3_prepare(db, sql, -1, &stmt, &pzTail);
 	if (rc!=SQLITE_OK)
-	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))));
-		sqlite3_close(db);
-	}
 
 	/* Get the result, and check for success. */
 	if (sqlite3_step(stmt) != SQLITE_DONE)
-	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				errmsg("SQL error during step: %s", sqlite3_errmsg(db))));
-		sqlite3_close(db);
-	}
 }
 
 /*
@@ -1926,7 +1896,11 @@ sqlitefdw_xact_callback(XactEvent event, void *arg)
 
 			switch (event)
 			{
+#if (PG_VERSION_NUM >= 90500)
 				case XACT_EVENT_PARALLEL_PRE_COMMIT:
+#endif
+
+#if (PG_VERSION_NUM >= 90300)
 				case XACT_EVENT_PRE_COMMIT:
 					/* Commit all remote transactions during pre-commit */
 					do_sql_command(entry->conn, "COMMIT TRANSACTION");
@@ -1948,13 +1922,19 @@ sqlitefdw_xact_callback(XactEvent event, void *arg)
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot prepare a transaction that modified remote tables")));
 					break;
+#endif
+
+#if (PG_VERSION_NUM >= 90500)
 				case XACT_EVENT_PARALLEL_COMMIT:
+#endif
 				case XACT_EVENT_COMMIT:
 				case XACT_EVENT_PREPARE:
 					/* Pre-commit should have closed the open transaction */
 					elog(ERROR, "missed cleaning up connection during pre-commit");
 					break;
+#if (PG_VERSION_NUM >= 90500)
 				case XACT_EVENT_PARALLEL_ABORT:
+#endif
 				case XACT_EVENT_ABORT:
 					/* Assume we might have lost track of prepared statements */
 					entry->have_error = true;
@@ -1988,10 +1968,15 @@ sqlitefdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	ConnCacheEntry *entry;
 	int			curlevel;
 
+#if (PG_VERSION_NUM >= 90300)
 	/* Nothing to do at subxact start, nor after commit. */
 	if (!(event == SUBXACT_EVENT_PRE_COMMIT_SUB ||
 		  event == SUBXACT_EVENT_ABORT_SUB))
 		return;
+#else
+	if (event != SUBXACT_EVENT_ABORT_SUB)
+		return;
+#endif
 
 	/* Quick exit if no connections were touched in this transaction. */
 	if (!xact_got_connection)
@@ -2018,6 +2003,7 @@ sqlitefdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			elog(ERROR, "missed cleaning up remote subtransaction at level %d",
 				 entry->xact_depth);
 
+#if (PG_VERSION_NUM >= 90300)
 		if (event == SUBXACT_EVENT_PRE_COMMIT_SUB)
 		{
 			/* Commit all remote subtransactions during pre-commit */
@@ -2025,6 +2011,7 @@ sqlitefdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			do_sql_command(entry->conn, sql);
 		}
 		else
+#endif
 		{
 			/* Assume we might have lost track of prepared statements */
 			entry->have_error = true;
@@ -2100,7 +2087,11 @@ GetConnection(Oid ftableId)
 		ctl.hcxt = CacheMemoryContext;
 		ConnectionHash = hash_create("sqlite_fdw connections", 4,
 									 &ctl,
+#if (PG_VERSION_NUM >= 90500)
 									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+#else
+									 HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
+#endif
 
 		/*
 		 * Register some callback functions that manage connection cleanup.
@@ -2151,12 +2142,9 @@ GetConnection(Oid ftableId)
 
 		sqliteGetOptions(ftableId, &database, &table);
 		if (sqlite3_open(database, &db))
-		{
 			ereport(ERROR,
 				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
 				errmsg("Can't open sqlite database %s: %s", database, sqlite3_errmsg(db))));
-			sqlite3_close(db);
-		}
 
 		entry->conn = db;
 		entry->xact_depth = 0;	/* just to be sure */
