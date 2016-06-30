@@ -17,17 +17,23 @@
 #include "postgres.h"
 
 #include "access/reloptions.h"
+#include "access/sysattr.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
+#include "miscadmin.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/var.h"
+#include "parser/parsetree.h"
 
 #include "funcapi.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
+#include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/lsyscache.h"
 
@@ -99,13 +105,13 @@ static List *sqlitePlanForeignModify(PlannerInfo *root,
 						   int subplan_index);
 
 static void sqliteBeginForeignModify(ModifyTableState *mtstate,
-							ResultRelInfo *rinfo,
+							ResultRelInfo *resultRelInfo,
 							List *fdw_private,
 							int subplan_index,
 							int eflags);
 
 static TupleTableSlot *sqliteExecForeignInsert(EState *estate,
-						   ResultRelInfo *rinfo,
+						   ResultRelInfo *resultRelInfo,
 						   TupleTableSlot *slot,
 						   TupleTableSlot *planSlot);
 
@@ -120,7 +126,7 @@ static TupleTableSlot *sqliteExecForeignDelete(EState *estate,
 						   TupleTableSlot *planSlot);
 
 static void sqliteEndForeignModify(EState *estate,
-						  ResultRelInfo *rinfo);
+						  ResultRelInfo *resultRelInfo);
 #endif
 
 static void sqliteExplainForeignScan(ForeignScanState *node,
@@ -202,6 +208,68 @@ typedef struct SQLiteFdwExecutionState
 	sqlite3_stmt  *result;
 	char          *query;
 } SQLiteFdwExecutionState;
+
+/*
+ * Execution state of a foreign insert operation.
+ */
+typedef struct SqliteFdwModifyState
+{
+	Relation	rel;			/* relcache entry for the foreign table */
+
+	/* for remote query execution */
+	sqlite3	   *conn;			/* connection for the scan */
+
+	/* extracted fdw_private data */
+	char	   *query;			/* text of INSERT/UPDATE/DELETE command */
+	List	   *target_attrs;	/* list of target attribute numbers */
+
+	/* info about parameters for prepared statement */
+	int			p_nums;			/* number of parameters to transmit */
+	FmgrInfo   *p_flinfo;		/* output conversion functions for them */
+
+	/* working memory context */
+	MemoryContext temp_cxt;		/* context for per-tuple temporary data */
+} SqliteFdwModifyState;
+
+/*
+ * Similarly, this enum describes what's kept in the fdw_private list for
+ * a ModifyTable node referencing a sqlite_fdw foreign table.  We store:
+ *
+ * 1) INSERT statement text to be sent to the remote server
+ * 2) Integer list of target attribute numbers
+ */
+enum FdwModifyPrivateIndex
+{
+	/* SQL statement to execute remotely (as a String node) */
+	FdwModifyPrivateUpdateSql,
+	/* Integer list of target attribute numbers for INSERT/UPDATE */
+	FdwModifyPrivateTargetAttnums,
+};
+
+/*
+ * Deparse functions
+ */
+
+#define REL_ALIAS_PREFIX	"r"
+/* Handy macro to add relation name qualification */
+#define ADD_REL_QUALIFIER(buf, varno)	\
+		appendStringInfo((buf), "%s%d.", REL_ALIAS_PREFIX, (varno))
+
+static void deparseInsertSql(StringInfo buf, PlannerInfo *root,
+				 Index rtindex, Relation rel, List *targetAttrs);
+static void deparseRelation(StringInfo buf, Relation rel);
+static void deparseColumnRef(StringInfo buf, int varno, int varattno, PlannerInfo *root,
+				 bool qualify_col);
+static void deparseTargetList(StringInfo buf,
+				  PlannerInfo *root,
+				  Index rtindex,
+				  Relation rel,
+				  bool is_returning,
+				  Bitmapset *attrs_used,
+				  bool qualify_col,
+				  List **retrieved_attrs);
+static const char **convert_prep_stmt_params(struct SqliteFdwModifyState *fmstate,
+						 TupleTableSlot *slot);
 
 
 Datum
@@ -806,16 +874,83 @@ sqlitePlanForeignModify(PlannerInfo *root,
 	 * BeginForeignModify will be NIL.
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	CmdType		operation = plan->operation;
+	RangeTblEntry *rte = planner_rt_fetch(resultRelation, root);
+	Relation	rel;
+	StringInfoData sql;
+	List	   *targetAttrs = NIL;
 
+	initStringInfo(&sql);
 
-	return NULL;
+	/*
+	 * Core code already has some lock on each rel being planned, so we can
+	 * use NoLock here.
+	 */
+	rel = heap_open(rte->relid, NoLock);
+
+	/*
+	 * In an INSERT, we transmit all columns that are defined in the foreign
+	 * table.  In an UPDATE, we transmit only columns that were explicitly
+	 * targets of the UPDATE, so as to avoid unnecessary data transmission.
+	 * (We can't do that for INSERT since we would miss sending default values
+	 * for columns not listed in the source statement.)
+	 */
+	if (operation == CMD_INSERT)
+	{
+		TupleDesc	tupdesc = RelationGetDescr(rel);
+		int			attnum;
+
+		for (attnum = 1; attnum <= tupdesc->natts; attnum++)
+		{
+			Form_pg_attribute attr = tupdesc->attrs[attnum - 1];
+
+			if (!attr->attisdropped)
+				targetAttrs = lappend_int(targetAttrs, attnum);
+		}
+	}
+
+	/*
+	 * No RETURNING list please.
+	 */
+	if (plan->returningLists)
+		elog(ERROR, "RETURNING not supported");
+
+	/*
+	 * No ON CONFLICT specification please.
+	 */
+	if (plan->onConflictAction != ONCONFLICT_NONE)
+		elog(ERROR, "ON CONFLICT specification not supported");
+
+	/*
+	 * Construct the SQL command string.
+	 */
+	switch (operation)
+	{
+		case CMD_INSERT:
+			deparseInsertSql(&sql, root, resultRelation, rel, targetAttrs);
+			break;
+		case CMD_UPDATE:
+		case CMD_DELETE:
+			elog(ERROR, "UPDATE and DELETE not supported");
+			break;
+		default:
+			elog(ERROR, "unexpected operation: %d", (int) operation);
+			break;
+	}
+
+	heap_close(rel, NoLock);
+
+	/*
+	 * Build the fdw_private list that will be available to the executor.
+	 * Items in the list must match enum FdwModifyPrivateIndex, above.
+	 */
+	return list_make2(makeString(sql.data), targetAttrs);
 }
 
 
 static void
 sqliteBeginForeignModify(ModifyTableState *mtstate,
-							ResultRelInfo *rinfo,
+							ResultRelInfo *resultRelInfo,
 							List *fdw_private,
 							int subplan_index,
 							int eflags)
@@ -846,14 +981,88 @@ sqliteBeginForeignModify(ModifyTableState *mtstate,
 	 * during executor startup.
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	sqlite3              *db;
+	char                 *svr_database = NULL;
+	char                 *svr_table = NULL;
+	SqliteFdwModifyState *fmstate;
+	EState	   *estate = mtstate->ps.state;
+	CmdType		operation = mtstate->operation;
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	AttrNumber	n_params;
+	Oid			typefnoid;
+	bool		isvarlena;
+	ListCell   *lc;
+
+	/*
+	 * Do nothing in EXPLAIN (no ANALYZE) case.  resultRelInfo->ri_FdwState
+	 * stays NULL.
+	 */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	/* Begin constructing SqliteFdwModifyState. */
+	fmstate = (SqliteFdwModifyState *) palloc0(sizeof(SqliteFdwModifyState));
+	fmstate->rel = rel;
+
+	/* Fetch options  */
+	sqliteGetOptions(RelationGetRelid(rel), &svr_database, &svr_table);
+
+	/* Connect to the server */
+	if (sqlite3_open(svr_database, &db)) {
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
+			));
+		sqlite3_close(db);
+	}
+
+	/* Open connection; report that we'll create a prepared statement. */
+	fmstate->conn = db;
+
+	/* Deconstruct fdw_private data. */
+	fmstate->query = strVal(list_nth(fdw_private,
+									 FdwModifyPrivateUpdateSql));
+	fmstate->target_attrs = (List *) list_nth(fdw_private,
+											  FdwModifyPrivateTargetAttnums);
+
+	/* Create context for per-tuple temp workspace. */
+	fmstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
+											  "sqlite_fdw temporary data",
+											  ALLOCSET_SMALL_MINSIZE,
+											  ALLOCSET_SMALL_INITSIZE,
+											  ALLOCSET_SMALL_MAXSIZE);
+
+	/* Prepare for output conversion of parameters used when binding. */
+	n_params = list_length(fmstate->target_attrs) + 1;
+	fmstate->p_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * n_params);
+	fmstate->p_nums = 0;
+
+	if (operation == CMD_INSERT)
+	{
+		/* Set up for remaining transmittable parameters */
+		foreach(lc, fmstate->target_attrs)
+		{
+			int			attnum = lfirst_int(lc);
+			Form_pg_attribute attr = RelationGetDescr(rel)->attrs[attnum - 1];
+
+			Assert(!attr->attisdropped);
+
+			getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
+			fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
+			fmstate->p_nums++;
+		}
+	}
+
+	Assert(fmstate->p_nums <= n_params);
+
+	resultRelInfo->ri_FdwState = fmstate;
 
 }
 
 
 static TupleTableSlot *
 sqliteExecForeignInsert(EState *estate,
-						   ResultRelInfo *rinfo,
+						   ResultRelInfo *resultRelInfo,
 						   TupleTableSlot *slot,
 						   TupleTableSlot *planSlot)
 {
@@ -884,7 +1093,68 @@ sqliteExecForeignInsert(EState *estate,
 	 *
 	 */
 
-	elog(DEBUG1,"entering function %s",__func__);
+	SqliteFdwModifyState *fmstate = (SqliteFdwModifyState *) resultRelInfo->ri_FdwState;
+	sqlite3_stmt *stmt;
+	const char **p_values;
+    const char  *pzTail;
+	int		i, rc;
+
+	/* Convert parameters needed by prepared statement to text form */
+	p_values = convert_prep_stmt_params(fmstate, slot);
+
+	/*
+	 * Prepare and bind.
+	 */
+	rc = sqlite3_prepare(fmstate->conn, fmstate->query, -1, &stmt, &pzTail);
+	if (rc!=SQLITE_OK)
+	{
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			errmsg("SQL error during prepare: %s", sqlite3_errmsg(fmstate->conn))
+			));
+		sqlite3_close(fmstate->conn);
+	}
+
+	for (i = 0; i < fmstate->p_nums; i++)
+	{
+		if (p_values[i])
+		{
+			int		len = strlen(p_values[i]);
+
+			rc = sqlite3_bind_text(stmt, i+1, p_values[i], len, SQLITE_STATIC);
+			if (rc!=SQLITE_OK)
+			{
+				ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				errmsg("SQL error during bind: %s", sqlite3_errmsg(fmstate->conn))));
+				sqlite3_close(fmstate->conn);
+			}
+		}
+		else
+		{
+			rc = sqlite3_bind_null(stmt, i+1);
+			if (rc!=SQLITE_OK)
+			{
+				ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				errmsg("SQL error during bind: %s", sqlite3_errmsg(fmstate->conn))));
+				sqlite3_close(fmstate->conn);
+			}
+		}
+	}
+
+	/*
+	 * Get the result, and check for success.
+	 */
+	if (sqlite3_step(stmt) != SQLITE_DONE)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				errmsg("SQL error during step: %s", sqlite3_errmsg(fmstate->conn))));
+				sqlite3_close(fmstate->conn);
+	}
+
+	MemoryContextReset(fmstate->temp_cxt);
 
 	return slot;
 }
@@ -967,7 +1237,7 @@ sqliteExecForeignDelete(EState *estate,
 
 static void
 sqliteEndForeignModify(EState *estate,
-						  ResultRelInfo *rinfo)
+						  ResultRelInfo *resultRelInfo)
 {
 	/*
 	 * End the table update and release resources. It is normally not
@@ -977,9 +1247,15 @@ sqliteEndForeignModify(EState *estate,
 	 * If the EndForeignModify pointer is set to NULL, no action is taken
 	 * during executor shutdown.
 	 */
+	SqliteFdwModifyState *fmstate = (SqliteFdwModifyState *) resultRelInfo->ri_FdwState;
 
-	elog(DEBUG1,"entering function %s",__func__);
+	/* If fmstate is NULL, we are in EXPLAIN; nothing to do */
+	if (fmstate == NULL)
+		return;
 
+	/* Release remote connection */
+	sqlite3_close(fmstate->conn);
+	fmstate->conn = NULL;
 }
 #endif
 
@@ -1051,7 +1327,7 @@ sqliteExplainForeignScan(ForeignScanState *node,
 		   it could be a good idea to add that later */
 		//for (x = 0; x < sqlite3_column_count(festate->result); x++)
 		//{
-			ExplainPropertyText("sqlite plan", (char*)sqlite3_column_text(result, 3), es);
+			ExplainPropertyText("sqlite plan", (char *) sqlite3_column_text(result, 3), es);
 		//}
 	}
 
@@ -1235,4 +1511,364 @@ file_exists(const char *name)
                  errmsg("could not access file \"%s\": %m", name)));
 
     return false;
+}
+
+/*
+ * deparse remote INSERT statement
+ *
+ * The statement text is appended to buf, and we also create an integer List
+ * of the columns being retrieved by RETURNING (if any), which is returned
+ * to *retrieved_attrs.
+ */
+static void
+deparseInsertSql(StringInfo buf, PlannerInfo *root,
+				 Index rtindex, Relation rel, List *targetAttrs)
+{
+	AttrNumber	pindex;
+	bool		first;
+	ListCell   *lc;
+
+	appendStringInfoString(buf, "INSERT INTO ");
+	deparseRelation(buf, rel);
+
+	if (targetAttrs)
+	{
+		appendStringInfoChar(buf, '(');
+
+		first = true;
+		foreach(lc, targetAttrs)
+		{
+			int			attnum = lfirst_int(lc);
+
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+
+			deparseColumnRef(buf, rtindex, attnum, root, false);
+		}
+
+		appendStringInfoString(buf, ") VALUES (");
+
+		pindex = 1;
+		first = true;
+		foreach(lc, targetAttrs)
+		{
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+
+			appendStringInfo(buf, "$%d", pindex);
+			pindex++;
+		}
+
+		appendStringInfoChar(buf, ')');
+	}
+	else
+		appendStringInfoString(buf, " DEFAULT VALUES");
+}
+
+/*
+ * Append remote name of specified foreign table to buf.
+ * Use value of table_name FDW option (if any) instead of relation's name.
+ * Similarly, schema_name FDW option overrides schema name.
+ */
+static void
+deparseRelation(StringInfo buf, Relation rel)
+{
+	ForeignTable *table;
+	const char *relname = NULL;
+	ListCell   *lc;
+
+	/* obtain additional catalog information. */
+	table = GetForeignTable(RelationGetRelid(rel));
+
+	/*
+	 * Use value of FDW options if any, instead of the name of object itself.
+	 */
+	foreach(lc, table->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "table") == 0)
+			relname = defGetString(def);
+	}
+
+	/*
+	 * Note: sqlite has no schemas as far as I know.
+	 */
+	if (relname == NULL)
+		relname = RelationGetRelationName(rel);
+
+	appendStringInfo(buf, "%s", quote_identifier(relname));
+}
+
+/*
+ * Construct name to use for given column, and emit it into buf.
+ * If it has a column_name FDW option, use that instead of attribute name.
+ *
+ * If qualify_col is true, qualify column name with the alias of relation.
+ */
+static void
+deparseColumnRef(StringInfo buf, int varno, int varattno, PlannerInfo *root,
+				 bool qualify_col)
+{
+	RangeTblEntry *rte;
+
+	if (varattno == SelfItemPointerAttributeNumber)
+	{
+		/* We support fetching the remote side's CTID. */
+		if (qualify_col)
+			ADD_REL_QUALIFIER(buf, varno);
+		appendStringInfoString(buf, "ctid");
+	}
+	else if (varattno < 0)
+	{
+		/*
+		 * All other system attributes are fetched as 0, except for table OID,
+		 * which is fetched as the local table OID.  However, we must be
+		 * careful; the table could be beneath an outer join, in which case it
+		 * must go to NULL whenever the rest of the row does.
+		 */
+		Oid			fetchval = 0;
+
+		if (varattno == TableOidAttributeNumber)
+		{
+			rte = planner_rt_fetch(varno, root);
+			fetchval = rte->relid;
+		}
+
+		if (qualify_col)
+		{
+			appendStringInfoString(buf, "CASE WHEN (");
+			ADD_REL_QUALIFIER(buf, varno);
+			appendStringInfo(buf, "*)::pg_catalog.text IS NOT NULL THEN %u END", fetchval);
+		}
+		else
+			appendStringInfo(buf, "%u", fetchval);
+	}
+	else if (varattno == 0)
+	{
+		/* Whole row reference */
+		Relation	rel;
+		Bitmapset  *attrs_used;
+
+		/* Required only to be passed down to deparseTargetList(). */
+		List	   *retrieved_attrs;
+
+		/* Get RangeTblEntry from array in PlannerInfo. */
+		rte = planner_rt_fetch(varno, root);
+
+		/*
+		 * The lock on the relation will be held by upper callers, so it's
+		 * fine to open it with no lock here.
+		 */
+		rel = heap_open(rte->relid, NoLock);
+
+		/*
+		 * The local name of the foreign table can not be recognized by the
+		 * foreign server and the table it references on foreign server might
+		 * have different column ordering or different columns than those
+		 * declared locally. Hence we have to deparse whole-row reference as
+		 * ROW(columns referenced locally). Construct this by deparsing a
+		 * "whole row" attribute.
+		 */
+		attrs_used = bms_add_member(NULL,
+									0 - FirstLowInvalidHeapAttributeNumber);
+
+		/*
+		 * In case the whole-row reference is under an outer join then it has
+		 * to go NULL whenver the rest of the row goes NULL. Deparsing a join
+		 * query would always involve multiple relations, thus qualify_col
+		 * would be true.
+		 */
+		if (qualify_col)
+		{
+			appendStringInfoString(buf, "CASE WHEN (");
+			ADD_REL_QUALIFIER(buf, varno);
+			appendStringInfo(buf, "*)::pg_catalog.text IS NOT NULL THEN ");
+		}
+
+		appendStringInfoString(buf, "ROW(");
+		deparseTargetList(buf, root, varno, rel, false, attrs_used, qualify_col,
+						  &retrieved_attrs);
+		appendStringInfoString(buf, ")");
+
+		/* Complete the CASE WHEN statement started above. */
+		if (qualify_col)
+			appendStringInfo(buf, " END");
+
+		heap_close(rel, NoLock);
+		bms_free(attrs_used);
+	}
+	else
+	{
+		char	   *colname = NULL;
+		List	   *options;
+		ListCell   *lc;
+
+		/* varno must not be any of OUTER_VAR, INNER_VAR and INDEX_VAR. */
+		Assert(!IS_SPECIAL_VARNO(varno));
+
+		/* Get RangeTblEntry from array in PlannerInfo. */
+		rte = planner_rt_fetch(varno, root);
+
+		/*
+		 * If it's a column of a foreign table, and it has the column_name FDW
+		 * option, use that value.
+		 */
+		options = GetForeignColumnOptions(rte->relid, varattno);
+		foreach(lc, options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "column_name") == 0)
+			{
+				colname = defGetString(def);
+				break;
+			}
+		}
+
+		/*
+		 * If it's a column of a regular table or it doesn't have column_name
+		 * FDW option, use attribute name.
+		 */
+		if (colname == NULL)
+			colname = get_relid_attribute_name(rte->relid, varattno);
+
+		if (qualify_col)
+			ADD_REL_QUALIFIER(buf, varno);
+
+		appendStringInfoString(buf, quote_identifier(colname));
+	}
+}
+
+/*
+ * Emit a target list that retrieves the columns specified in attrs_used.
+ * This is used for both SELECT and RETURNING targetlists; the is_returning
+ * parameter is true only for a RETURNING targetlist.
+ *
+ * The tlist text is appended to buf, and we also create an integer List
+ * of the columns being retrieved, which is returned to *retrieved_attrs.
+ *
+ * If qualify_col is true, add relation alias before the column name.
+ */
+static void
+deparseTargetList(StringInfo buf,
+				  PlannerInfo *root,
+				  Index rtindex,
+				  Relation rel,
+				  bool is_returning,
+				  Bitmapset *attrs_used,
+				  bool qualify_col,
+				  List **retrieved_attrs)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	bool		have_wholerow;
+	bool		first;
+	int			i;
+
+	*retrieved_attrs = NIL;
+
+	/* If there's a whole-row reference, we'll need all the columns. */
+	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
+								  attrs_used);
+
+	first = true;
+	for (i = 1; i <= tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = tupdesc->attrs[i - 1];
+
+		/* Ignore dropped attributes. */
+		if (attr->attisdropped)
+			continue;
+
+		if (have_wholerow ||
+			bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
+						  attrs_used))
+		{
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			else if (is_returning)
+				appendStringInfoString(buf, " RETURNING ");
+			first = false;
+
+			deparseColumnRef(buf, rtindex, i, root, qualify_col);
+
+			*retrieved_attrs = lappend_int(*retrieved_attrs, i);
+		}
+	}
+
+	/*
+	 * Add ctid if needed.  We currently don't support retrieving any other
+	 * system columns.
+	 */
+	if (bms_is_member(SelfItemPointerAttributeNumber - FirstLowInvalidHeapAttributeNumber,
+					  attrs_used))
+	{
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		else if (is_returning)
+			appendStringInfoString(buf, " RETURNING ");
+		first = false;
+
+		if (qualify_col)
+			ADD_REL_QUALIFIER(buf, rtindex);
+		appendStringInfoString(buf, "ctid");
+
+		*retrieved_attrs = lappend_int(*retrieved_attrs,
+									   SelfItemPointerAttributeNumber);
+	}
+
+	/* Don't generate bad syntax if no undropped columns */
+	if (first && !is_returning)
+		appendStringInfoString(buf, "NULL");
+}
+
+/*
+ * convert_prep_stmt_params
+ *		Create array of text strings representing parameter values
+ *
+ * tupleid is ctid to send, or NULL if none
+ * slot is slot to get remaining parameters from, or NULL if none
+ *
+ * Data is constructed in temp_cxt; caller should reset that after use.
+ */
+static const char **
+convert_prep_stmt_params(SqliteFdwModifyState *fmstate,
+						 TupleTableSlot *slot)
+{
+	const char **p_values;
+	int			pindex = 0;
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(fmstate->temp_cxt);
+
+	p_values = (const char **) palloc(sizeof(char *) * fmstate->p_nums);
+
+	/* get following parameters from slot */
+	if (slot != NULL && fmstate->target_attrs != NIL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, fmstate->target_attrs)
+		{
+			int			attnum = lfirst_int(lc);
+			Datum		value;
+			bool		isnull;
+
+			value = slot_getattr(slot, attnum, &isnull);
+			if (isnull)
+				p_values[pindex] = NULL;
+			else
+				p_values[pindex] = OutputFunctionCall(&fmstate->p_flinfo[pindex],
+													  value);
+			pindex++;
+		}
+	}
+
+	Assert(pindex == fmstate->p_nums);
+
+	MemoryContextSwitchTo(oldcontext);
+
+	return p_values;
 }
