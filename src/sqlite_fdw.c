@@ -18,6 +18,7 @@
 
 #include "access/reloptions.h"
 #include "access/sysattr.h"
+#include "access/xact.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -219,6 +220,9 @@ typedef struct SqliteFdwModifyState
 	/* for remote query execution */
 	sqlite3	   *conn;			/* connection for the scan */
 
+	/* prepared statement */
+	sqlite3_stmt *stmt;
+
 	/* extracted fdw_private data */
 	char	   *query;			/* text of INSERT/UPDATE/DELETE command */
 	List	   *target_attrs;	/* list of target attribute numbers */
@@ -270,7 +274,8 @@ static void deparseTargetList(StringInfo buf,
 				  List **retrieved_attrs);
 static const char **convert_prep_stmt_params(struct SqliteFdwModifyState *fmstate,
 						 TupleTableSlot *slot);
-
+static sqlite3 *GetConnection(Oid ftableId);
+static void ReleaseConnection(sqlite3* db);
 
 Datum
 sqlite_fdw_handler(PG_FUNCTION_ARGS)
@@ -325,8 +330,8 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 {
 	List      *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid       catalog = PG_GETARG_OID(1);
-	char      *svr_database = NULL;
-	char      *svr_table = NULL;
+	char      *database = NULL;
+	char      *table = NULL;
 	ListCell  *cell;
 
 	elog(DEBUG1,"entering function %s",__func__);
@@ -365,7 +370,7 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 
 		if (strcmp(def->defname, "database") == 0)
 		{
-			if (svr_database)
+			if (database)
 				ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					errmsg("redundant options: database (%s)", defGetString(def))
@@ -376,22 +381,22 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 					errmsg("could not access file \"%s\"", defGetString(def))
 					));
 
-			svr_database = defGetString(def);
+			database = defGetString(def);
 		}
 		else if (strcmp(def->defname, "table") == 0)
 		{
-			if (svr_table)
+			if (table)
 				ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					errmsg("redundant options: table (%s)", defGetString(def))
 					));
 
-			svr_table = defGetString(def);
+			table = defGetString(def);
 		}
 	}
 
 	/* Check we have the options we need to proceed */
-	if (catalog == ForeignServerRelationId && !svr_database)
+	if (catalog == ForeignServerRelationId && !database)
 		ereport(ERROR,
 			(errcode(ERRCODE_SYNTAX_ERROR),
 			errmsg("The database name must be specified")
@@ -653,39 +658,27 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	 * ExplainForeignScan and EndForeignScan.
 	 *
 	 */
-	sqlite3                  *db;
 	SQLiteFdwExecutionState  *festate;
-	char                     *svr_database = NULL;
-	char                     *svr_table = NULL;
+	char					 *database;
+	char					 *table;
 	char                     *query;
     size_t                   len;
 
 	elog(DEBUG1,"entering function %s",__func__);
 
-	/* Fetch options  */
-	sqliteGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_database, &svr_table);
-
-	/* Connect to the server */
-	if (sqlite3_open(svr_database, &db)) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
+	sqliteGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &database, &table);
 
 	/* Build the query */
-    len = strlen(svr_table) + 15;
-    query = (char *)palloc(len);
-    snprintf(query, len, "SELECT * FROM %s", svr_table);
+    len = strlen(table) + 15;
+    query = (char *) palloc0(len);
+    snprintf(query, len, "SELECT * FROM %s", table);
 
 	/* Stash away the state info we have already */
 	festate = (SQLiteFdwExecutionState *) palloc(sizeof(SQLiteFdwExecutionState));
 	node->fdw_state = (void *) festate;
-	festate->conn = db;
+	festate->conn = GetConnection(RelationGetRelid(node->ss.ss_currentRelation));
 	festate->result = NULL;
 	festate->query = query;
-
 }
 
 
@@ -981,9 +974,6 @@ sqliteBeginForeignModify(ModifyTableState *mtstate,
 	 * during executor startup.
 	 */
 
-	sqlite3              *db;
-	char                 *svr_database = NULL;
-	char                 *svr_table = NULL;
 	SqliteFdwModifyState *fmstate;
 	EState	   *estate = mtstate->ps.state;
 	CmdType		operation = mtstate->operation;
@@ -1004,20 +994,8 @@ sqliteBeginForeignModify(ModifyTableState *mtstate,
 	fmstate = (SqliteFdwModifyState *) palloc0(sizeof(SqliteFdwModifyState));
 	fmstate->rel = rel;
 
-	/* Fetch options  */
-	sqliteGetOptions(RelationGetRelid(rel), &svr_database, &svr_table);
-
-	/* Connect to the server */
-	if (sqlite3_open(svr_database, &db)) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
-
-	/* Open connection; report that we'll create a prepared statement. */
-	fmstate->conn = db;
+	/* Our connection to database. */
+	fmstate->conn = GetConnection(RelationGetRelid(rel));
 
 	/* Deconstruct fdw_private data. */
 	fmstate->query = strVal(list_nth(fdw_private,
@@ -1094,7 +1072,6 @@ sqliteExecForeignInsert(EState *estate,
 	 */
 
 	SqliteFdwModifyState *fmstate = (SqliteFdwModifyState *) resultRelInfo->ri_FdwState;
-	sqlite3_stmt *stmt;
 	const char **p_values;
     const char  *pzTail;
 	int		i, rc;
@@ -1102,55 +1079,70 @@ sqliteExecForeignInsert(EState *estate,
 	/* Convert parameters needed by prepared statement to text form */
 	p_values = convert_prep_stmt_params(fmstate, slot);
 
-	/*
-	 * Prepare and bind.
-	 */
-	rc = sqlite3_prepare(fmstate->conn, fmstate->query, -1, &stmt, &pzTail);
-	if (rc!=SQLITE_OK)
+	/* Prepare if not done yet. */
+	if (fmstate->stmt == NULL)
 	{
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-			errmsg("SQL error during prepare: %s", sqlite3_errmsg(fmstate->conn))
-			));
-		sqlite3_close(fmstate->conn);
+		rc = sqlite3_prepare(fmstate->conn, fmstate->query, -1, &fmstate->stmt, &pzTail);
+		if (rc!=SQLITE_OK)
+		{
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				errmsg("SQL error during prepare: %s", sqlite3_errmsg(fmstate->conn))));
+			sqlite3_close(fmstate->conn);
+		}
 	}
 
+	/* Bind using values of current input tuple */
 	for (i = 0; i < fmstate->p_nums; i++)
 	{
 		if (p_values[i])
 		{
 			int		len = strlen(p_values[i]);
 
-			rc = sqlite3_bind_text(stmt, i+1, p_values[i], len, SQLITE_STATIC);
+			rc = sqlite3_bind_text(fmstate->stmt, i+1, p_values[i], len, SQLITE_STATIC);
 			if (rc!=SQLITE_OK)
 			{
 				ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				errmsg("SQL error during bind: %s", sqlite3_errmsg(fmstate->conn))));
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					errmsg("SQL error during bind: %s", sqlite3_errmsg(fmstate->conn))));
 				sqlite3_close(fmstate->conn);
 			}
 		}
 		else
 		{
-			rc = sqlite3_bind_null(stmt, i+1);
+			rc = sqlite3_bind_null(fmstate->stmt, i+1);
 			if (rc!=SQLITE_OK)
 			{
 				ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				errmsg("SQL error during bind: %s", sqlite3_errmsg(fmstate->conn))));
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					errmsg("SQL error during bind: %s", sqlite3_errmsg(fmstate->conn))));
 				sqlite3_close(fmstate->conn);
 			}
 		}
 	}
 
-	/*
-	 * Get the result, and check for success.
-	 */
-	if (sqlite3_step(stmt) != SQLITE_DONE)
+	/* Get the result, and check for success. */
+	if (sqlite3_step(fmstate->stmt) != SQLITE_DONE)
 	{
 		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				errmsg("SQL error during step: %s", sqlite3_errmsg(fmstate->conn))));
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					errmsg("SQL error during step: %s", sqlite3_errmsg(fmstate->conn))));
+				sqlite3_close(fmstate->conn);
+	}
+
+	if (sqlite3_clear_bindings(fmstate->stmt) != SQLITE_OK)
+	{
+		ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					errmsg("SQL error during clear bindings: %s", sqlite3_errmsg(fmstate->conn))));
+				sqlite3_close(fmstate->conn);
+	}
+
+	if (sqlite3_reset(fmstate->stmt) != SQLITE_OK)
+	{
+		ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					errmsg("SQL error during reset: %s", sqlite3_errmsg(fmstate->conn))));
 				sqlite3_close(fmstate->conn);
 	}
 
@@ -1248,13 +1240,22 @@ sqliteEndForeignModify(EState *estate,
 	 * during executor shutdown.
 	 */
 	SqliteFdwModifyState *fmstate = (SqliteFdwModifyState *) resultRelInfo->ri_FdwState;
+	int		rc;
 
 	/* If fmstate is NULL, we are in EXPLAIN; nothing to do */
 	if (fmstate == NULL)
 		return;
 
+	if (fmstate->stmt)
+	{
+		rc = sqlite3_finalize(fmstate->stmt);
+		if (rc != SQLITE_OK)
+			elog(ERROR, "could not finalize statement");
+		fmstate->stmt = NULL;
+	}
+
 	/* Release remote connection */
-	sqlite3_close(fmstate->conn);
+	ReleaseConnection(fmstate->conn);
 	fmstate->conn = NULL;
 }
 #endif
@@ -1276,8 +1277,6 @@ sqliteExplainForeignScan(ForeignScanState *node,
 	 */
 	sqlite3                  *db;
 	sqlite3_stmt             *result;
-	char                     *svr_database = NULL;
-	char                     *svr_table = NULL;
 	char                     *query;
     size_t                   len;
     int                      rc;
@@ -1293,17 +1292,8 @@ sqliteExplainForeignScan(ForeignScanState *node,
 		ExplainPropertyText("sqlite query", festate->query, es);
 	}
 
-	/* Fetch options  */
-	sqliteGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_database, &svr_table);
-
 	/* Connect to the server */
-	if (sqlite3_open(svr_database, &db)) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
+	db = GetConnection(RelationGetRelid(node->ss.ss_currentRelation));
 
 	/* Build the query */
     len = strlen(festate->query) + 20;
@@ -1408,28 +1398,21 @@ sqliteAnalyzeForeignTable(Relation relation,
 static int
 GetEstimatedRows(Oid foreigntableid)
 {
-	sqlite3                  *db;
-	sqlite3_stmt             *result;
-	char                     *svr_database = NULL;
-	char                     *svr_table = NULL;
-	char                     *query;
-    size_t                   len;
-    int                      rc;
-    const char  *pzTail;
+	sqlite3		   *db;
+	sqlite3_stmt   *result;
+	char		   *database;
+	char		   *table;
+	char		   *query;
+    size_t			len;
+    int				rc;
+    const char	   *pzTail;
 
 	int rows = 0;
 
-	/* Fetch options  */
-	sqliteGetOptions(foreigntableid, &svr_database, &svr_table);
+	sqliteGetOptions(foreigntableid, &database, &table);
 
 	/* Connect to the server */
-	if (sqlite3_open(svr_database, &db)) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
+	db = GetConnection(foreigntableid);
 
 	/* Check that the sqlite_stat1 table exists */
 	rc = sqlite3_prepare(db, "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'", -1, &result, &pzTail);
@@ -1445,7 +1428,7 @@ GetEstimatedRows(Oid foreigntableid)
 		ereport(WARNING,
 			(errcode(ERRCODE_FDW_TABLE_NOT_FOUND),
 			errmsg("The sqlite3 database has not been analyzed."),
-			errhint("Run ANALYZE on table \"%s\", database \"%s\".", svr_table, svr_database)
+			errhint("Run ANALYZE on table \"%s\", database \"%s\".", table, database)
 			));
 		rows = 10;
 	}
@@ -1456,9 +1439,9 @@ GetEstimatedRows(Oid foreigntableid)
 	if (rows == 0)
 	{
 		/* Build the query */
-	    len = strlen(svr_table) + 60;
+	    len = strlen(table) + 60;
 	    query = (char *)palloc(len);
-	    snprintf(query, len, "SELECT stat FROM sqlite_stat1 WHERE tbl='%s' AND idx IS NULL", svr_table);
+	    snprintf(query, len, "SELECT stat FROM sqlite_stat1 WHERE tbl='%s' AND idx IS NULL", table);
 	    elog(LOG, "query:%s", query);
 
 	    /* Execute the query */
@@ -1871,4 +1854,329 @@ convert_prep_stmt_params(SqliteFdwModifyState *fmstate,
 	MemoryContextSwitchTo(oldcontext);
 
 	return p_values;
+}
+
+/*
+ * Connection cache (inited on the first use)
+ */
+static HTAB *ConnectionHash = NULL;
+static bool xact_got_connection = false;
+
+typedef Oid ConnCacheKey;
+typedef struct ConnCacheEntry
+{
+	ConnCacheKey key;			/* hash key, must be first */
+	sqlite3	   *conn;
+	int			xact_depth;		/* 0 = no xact open, 1 = main xact open, 2 =
+								 * one level of subxact open, etc. */
+	bool		have_error;		/* have any subxacts aborted in this xact? */
+} ConnCacheEntry;
+
+static void
+do_sql_command(sqlite3 *db, const char *sql)
+{
+	sqlite3_stmt *stmt;
+    const char  *pzTail;
+	int		rc;
+
+	rc = sqlite3_prepare(db, sql, -1, &stmt, &pzTail);
+	if (rc!=SQLITE_OK)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))));
+		sqlite3_close(db);
+	}
+
+	/* Get the result, and check for success. */
+	if (sqlite3_step(stmt) != SQLITE_DONE)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				errmsg("SQL error during step: %s", sqlite3_errmsg(db))));
+		sqlite3_close(db);
+	}
+}
+
+/*
+ * sqlitefdw_xact_callback --- cleanup at main-transaction end.
+ */
+static void
+sqlitefdw_xact_callback(XactEvent event, void *arg)
+{
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+
+	/*
+	 * Scan all connection cache entries to find open remote transactions, and
+	 * close them.
+	 */
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+	{
+		/* Ignore cache entry if no open connection right now */
+		if (entry->conn == NULL)
+			continue;
+
+		/* If it has an open remote transaction, try to close it */
+		if (entry->xact_depth > 0)
+		{
+			elog(DEBUG3, "closing remote transaction on connection %p",
+				 entry->conn);
+
+			switch (event)
+			{
+				case XACT_EVENT_PARALLEL_PRE_COMMIT:
+				case XACT_EVENT_PRE_COMMIT:
+					/* Commit all remote transactions during pre-commit */
+					do_sql_command(entry->conn, "COMMIT TRANSACTION");
+
+					entry->have_error = false;
+					break;
+				case XACT_EVENT_PRE_PREPARE:
+
+					/*
+					 * We disallow remote transactions that modified anything,
+					 * since it's not very reasonable to hold them open until
+					 * the prepared transaction is committed.  For the moment,
+					 * throw error unconditionally; later we might allow
+					 * read-only cases.  Note that the error will cause us to
+					 * come right back here with event == XACT_EVENT_ABORT, so
+					 * we'll clean up the connection state at that point.
+					 */
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot prepare a transaction that modified remote tables")));
+					break;
+				case XACT_EVENT_PARALLEL_COMMIT:
+				case XACT_EVENT_COMMIT:
+				case XACT_EVENT_PREPARE:
+					/* Pre-commit should have closed the open transaction */
+					elog(ERROR, "missed cleaning up connection during pre-commit");
+					break;
+				case XACT_EVENT_PARALLEL_ABORT:
+				case XACT_EVENT_ABORT:
+					/* Assume we might have lost track of prepared statements */
+					entry->have_error = true;
+
+					/* If we're aborting, abort all remote transactions too */
+					do_sql_command(entry->conn, "ROLLBACK TRANSACTION");
+					break;
+			}
+		}
+
+		/* Reset state to show we're out of a transaction */
+		entry->xact_depth = 0;
+	}
+
+	/*
+	 * Regardless of the event type, we can now mark ourselves as out of the
+	 * transaction.  (Note: if we are here during PRE_COMMIT or PRE_PREPARE,
+	 * this saves a useless scan of the hashtable during COMMIT or PREPARE.)
+	 */
+	xact_got_connection = false;
+}
+
+/*
+ * sqlitefdw_subxact_callback --- cleanup at subtransaction end.
+ */
+static void
+sqlitefdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						   SubTransactionId parentSubid, void *arg)
+{
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+	int			curlevel;
+
+	/* Nothing to do at subxact start, nor after commit. */
+	if (!(event == SUBXACT_EVENT_PRE_COMMIT_SUB ||
+		  event == SUBXACT_EVENT_ABORT_SUB))
+		return;
+
+	/* Quick exit if no connections were touched in this transaction. */
+	if (!xact_got_connection)
+		return;
+
+	/*
+	 * Scan all connection cache entries to find open remote subtransactions
+	 * of the current level, and close them.
+	 */
+	curlevel = GetCurrentTransactionNestLevel();
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+	{
+		char		sql[100];
+
+		/*
+		 * We only care about connections with open remote subtransactions of
+		 * the current level.
+		 */
+		if (entry->conn == NULL || entry->xact_depth < curlevel)
+			continue;
+
+		if (entry->xact_depth > curlevel)
+			elog(ERROR, "missed cleaning up remote subtransaction at level %d",
+				 entry->xact_depth);
+
+		if (event == SUBXACT_EVENT_PRE_COMMIT_SUB)
+		{
+			/* Commit all remote subtransactions during pre-commit */
+			snprintf(sql, sizeof(sql), "RELEASE SAVEPOINT s%d", curlevel);
+			do_sql_command(entry->conn, sql);
+		}
+		else
+		{
+			/* Assume we might have lost track of prepared statements */
+			entry->have_error = true;
+
+			/* Rollback all remote subtransactions during abort */
+			snprintf(sql, sizeof(sql),
+					 "ROLLBACK TO SAVEPOINT s%d; RELEASE SAVEPOINT s%d",
+					 curlevel, curlevel);
+			do_sql_command(entry->conn, sql);
+		}
+
+		/* OK, we're outta that level of subtransaction */
+		entry->xact_depth--;
+	}
+}
+
+/*
+ * Start remote transaction or subtransaction, if needed.
+ */
+static void
+begin_remote_xact(ConnCacheEntry *entry)
+{
+	int			curlevel = GetCurrentTransactionNestLevel();
+
+	/* Start main transaction if we haven't yet */
+	if (entry->xact_depth <= 0)
+	{
+		const char *sql;
+
+		sql = "BEGIN TRANSACTION";
+		do_sql_command(entry->conn, sql);
+		entry->xact_depth = 1;
+	}
+
+	/*
+	 * If we're in a subtransaction, stack up savepoints to match our level.
+	 * This ensures we can rollback just the desired effects when a
+	 * subtransaction aborts.
+	 */
+	while (entry->xact_depth < curlevel)
+	{
+		char		sql[64];
+
+		snprintf(sql, sizeof(sql), "SAVEPOINT s%d", entry->xact_depth + 1);
+		do_sql_command(entry->conn, sql);
+		entry->xact_depth++;
+	}
+}
+
+/*
+ * Get a sqlite3 connection object which can be used to execute queries.
+ * server with the user's authorization.  A new connection is established
+ * if we don't already have a suitable one, and a transaction is opened at
+ * the right subtransaction nesting depth if we didn't do that already.
+ */
+static sqlite3 *
+GetConnection(Oid ftableId)
+{
+	bool	found;
+	ForeignTable   *f_table;
+	ConnCacheEntry *entry;
+	ConnCacheKey key;
+
+	/* First time through, initialize connection cache hashtable */
+	if (ConnectionHash == NULL)
+	{
+		HASHCTL		ctl;
+
+		MemSet(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(ConnCacheKey);
+		ctl.entrysize = sizeof(ConnCacheEntry);
+		/* allocate ConnectionHash in the cache context */
+		ctl.hcxt = CacheMemoryContext;
+		ConnectionHash = hash_create("sqlite_fdw connections", 4,
+									 &ctl,
+									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+		/*
+		 * Register some callback functions that manage connection cleanup.
+		 * This should be done just once in each backend.
+		 */
+		RegisterXactCallback(sqlitefdw_xact_callback, NULL);
+		RegisterSubXactCallback(sqlitefdw_subxact_callback, NULL);
+	}
+
+
+	/* Set flag that we did GetConnection during the current transaction */
+	xact_got_connection = true;
+
+	/* Create hash key for the entry.  Assume no pad bytes in key struct */
+	f_table = GetForeignTable(ftableId);
+	key = f_table->serverid;
+
+	/*
+	 * Find or create cached entry for requested connection.
+	 */
+	entry = hash_search(ConnectionHash, &key, HASH_ENTER, &found);
+	if (!found)
+	{
+		/* initialize new hashtable entry (key is already filled in) */
+		entry->conn = NULL;
+		entry->xact_depth = 0;
+		entry->have_error = false;
+	}
+
+	/*
+	 * We don't check the health of cached connection here, because it would
+	 * require some overhead.  Broken connection will be detected when the
+	 * connection is actually used.
+	 */
+
+	/*
+	 * If cache entry doesn't have a connection, we have to establish a new
+	 * connection.  (If connect_pg_server throws an error, the cache entry
+	 * will be left in a valid empty state.)
+	 */
+
+	/* Connect to the database */
+	if (entry->conn == NULL)
+	{
+		sqlite3 *db;
+		char   *database = NULL;
+		char   *table = NULL;
+
+		sqliteGetOptions(ftableId, &database, &table);
+		if (sqlite3_open(database, &db))
+		{
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+				errmsg("Can't open sqlite database %s: %s", database, sqlite3_errmsg(db))));
+			sqlite3_close(db);
+		}
+
+		entry->conn = db;
+		entry->xact_depth = 0;	/* just to be sure */
+		entry->have_error = false;
+	}
+
+	/*
+	 * Start a new transaction or subtransaction if needed.
+	 */
+	begin_remote_xact(entry);
+
+	return entry->conn;
+}
+
+static void
+ReleaseConnection(sqlite3* db)
+{
+	/*
+	 * Currently, we don't actually track connection references because all
+	 * cleanup is managed on a transaction or subtransaction basis instead. So
+	 * there's nothing to do here.
+	 */
 }
