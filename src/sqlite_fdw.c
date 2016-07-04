@@ -22,6 +22,7 @@
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
+#include "nodes/parsenodes.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
@@ -147,6 +148,12 @@ static bool sqliteAnalyzeForeignTable(Relation relation,
 							 BlockNumber *totalpages);
 #endif
 
+#if (PG_VERSION_NUM >= 90500)
+static List *sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
+							Oid serverOid);
+static void deparseStringLiteral(StringInfo buf, const char *val);
+#endif
+
 /*
  * Helper functions
  */
@@ -155,7 +162,6 @@ static void sqliteServerGetOptions(Oid foreignserverid, char **database);
 static void sqliteTableGetOptions(Oid foreigntableid, char **table);
 static int GetEstimatedRows(Oid foreigntableid);
 static bool file_exists(const char *name);
-
 
 /* 
  * structures used by the FDW 
@@ -324,6 +330,11 @@ sqlite_fdw_handler(PG_FUNCTION_ARGS)
 #if (PG_VERSION_NUM >= 90200)
 	/* support for ANALYSE */
 	fdwroutine->AnalyzeForeignTable = sqliteAnalyzeForeignTable;
+#endif
+
+#if (PG_VERSION_NUM >= 90500)
+	/* Support functions for IMPORT FOREIGN SCHEMA */
+	fdwroutine->ImportForeignSchema = sqliteImportForeignSchema;
 #endif
 
 	PG_RETURN_POINTER(fdwroutine);
@@ -1849,6 +1860,241 @@ file_exists(const char *name)
 
     return false;
 }
+
+#if (PG_VERSION_NUM >= 90500)
+/*
+ * Import a foreign schema
+ */
+static List *
+sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
+{
+	List	   *commands = NIL;
+	bool		import_default = false;
+	bool		import_not_null = true;
+	ListCell   *lc;
+	sqlite3 *db1 = NULL, *db2 = NULL;
+	sqlite3_stmt *result1 = NULL, *result2 = NULL;
+
+	/* Parse statement options */
+	foreach(lc, stmt->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "import_default") == 0)
+			import_default = defGetBoolean(def);
+		else if (strcmp(def->defname, "import_not_null") == 0)
+			import_not_null = defGetBoolean(def);
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("invalid option \"%s\"", def->defname)));
+	}
+
+	PG_TRY();
+	{
+		int		rc;
+		const char *pzTail;
+		StringInfoData buf;
+		ForeignServer *server;
+		char		  *database;
+
+		server = GetForeignServer(serverOid);
+		sqliteServerGetOptions(serverOid, &database);
+
+		/* Not really any schema here: stmt->remote_schema is a dummy */
+		rc = sqlite3_open(database, &db1);
+		if (rc != SQLITE_OK)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_SCHEMA_NOT_FOUND),
+			  errmsg("database \"%s\" is not present on foreign server \"%s\"",
+					 database, server->servername)));
+
+		/*
+		 * One more connection to use inside the loop over tables to avoid
+		 * stepping on outer connection's state.  XXX - paranoia?
+		 */
+		rc = sqlite3_open(database, &db2);
+		if (rc != SQLITE_OK)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_SCHEMA_NOT_FOUND),
+			  errmsg("cannot connect to database \"%s\"", stmt->remote_schema)));
+
+		/*
+		 * 1. Get names of all user-defined tables and then iterate over.
+		 */
+		initStringInfo(&buf);
+
+		appendStringInfoString(&buf, "select name"
+									 " from sqlite_master"
+									 " where type = 'table'");
+
+		/* Apply restrictions for LIMIT TO and EXCEPT */
+		if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO ||
+			stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
+		{
+			bool		first_item = true;
+
+			appendStringInfoString(&buf, " and name ");
+			if (stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
+				appendStringInfoString(&buf, "not ");
+			appendStringInfoString(&buf, "in (");
+
+			/* Append list of table names within IN clause */
+			foreach(lc, stmt->table_list)
+			{
+				RangeVar   *rv = (RangeVar *) lfirst(lc);
+
+				if (first_item)
+					first_item = false;
+				else
+					appendStringInfoString(&buf, ", ");
+				deparseStringLiteral(&buf, rv->relname);
+			}
+			appendStringInfoChar(&buf, ')');
+		}
+
+		/* Filter out sqlite internal tables */
+		appendStringInfoString(&buf, " and name not like 'sqlite_%%'");
+		appendStringInfoString(&buf, " order by name");
+
+		rc = sqlite3_prepare(db1, buf.data, -1, &result1, &pzTail);
+		if (rc!=SQLITE_OK)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					errmsg("SQL error during prepare: %s", sqlite3_errmsg(db1))));
+
+		while (sqlite3_step(result1) == SQLITE_ROW)
+		{
+			int			rc;
+			const char *pzTail;
+			char	   *table_name = (char *) sqlite3_column_text(result1, 0);
+			bool		first_item = true;
+			StringInfoData sqlite_cmd_buf;
+
+			/*
+			 * 2. Start with "CREATE FOREIGN TABLE %s (\n", table_name
+			 */
+			/* Initialize local command */
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "create foreign table %s (\n",
+							 quote_identifier(table_name));
+
+			/*
+			 * 3. Get result for PRAGMA table_info(table_name)
+			 */
+			initStringInfo(&sqlite_cmd_buf);
+			appendStringInfo(&sqlite_cmd_buf, "pragma table_info (%s)", table_name);
+			rc = sqlite3_prepare(db2, sqlite_cmd_buf.data, -1, &result2, &pzTail);
+			if (rc!=SQLITE_OK)
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+						errmsg("SQL error during prepare: %s", sqlite3_errmsg(db2))));
+
+			while(sqlite3_step(result2) == SQLITE_ROW)
+			{
+				char   *attname = (char *) sqlite3_column_text(result2, 1);
+				char   *typename = (char *) sqlite3_column_text(result2, 2);
+				int		attnotnull = (int) sqlite3_column_int(result2, 3);
+				char   *attdefault = (char *) sqlite3_column_text(result2, 4);
+
+				if (first_item)
+					first_item = false;
+				else
+					appendStringInfoString(&buf, ",\n");
+
+				/*
+				 * 4. Construct rest of the command
+				 *
+				 *    column_name type_name [ default <val> ] [ not null ]
+				 *
+				 * XXX: columns options not supported by this fdw.
+				 */
+				if (!strcmp(typename, "blob"))
+					typename = "bytea";
+
+				appendStringInfo(&buf, "  %s %s",
+								 quote_identifier(attname),
+								 typename);
+
+				/* Add DEFAULT if needed */
+				if (import_default && attdefault != NULL)
+					appendStringInfo(&buf, " default %s", attdefault);
+
+				/* Add NOT NULL if needed */
+				if (import_not_null && attnotnull == 1)
+					appendStringInfoString(&buf, " not null");
+			}
+
+			/*
+			 * 5. Add server name and table-level options.  We specify table
+			 * name as option to ensure that renaming the foreign table
+			 * doesn't break the association).
+			 */
+			appendStringInfo(&buf, "\n) server %s\noptions (",
+							 quote_identifier(server->servername));
+
+			appendStringInfoString(&buf, "table ");
+			deparseStringLiteral(&buf, table_name);
+
+			appendStringInfoString(&buf, ");");
+
+			commands = lappend(commands, pstrdup(buf.data));
+
+			/* Clean up */
+			if (result2)
+				sqlite3_finalize(result2);
+		}
+
+		/* Clean up */
+		if (result1)
+			sqlite3_finalize(result1);
+	}
+	PG_CATCH();
+	{
+		if (result1)
+			sqlite3_finalize(result1);
+
+		if (result2)
+			sqlite3_finalize(result2);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	sqlite3_close(db2);
+	sqlite3_close(db1);
+
+	return commands;
+}
+
+/*
+ * Append a SQL string literal representing "val" to buf.
+ */
+static void
+deparseStringLiteral(StringInfo buf, const char *val)
+{
+	const char *valptr;
+
+	/*
+	 * Rather than making assumptions about the remote server's value of
+	 * standard_conforming_strings, always use E'foo' syntax if there are any
+	 * backslashes.  This will fail on remote servers before 8.1, but those
+	 * are long out of support.
+	 */
+	if (strchr(val, '\\') != NULL)
+		appendStringInfoChar(buf, ESCAPE_STRING_SYNTAX);
+	appendStringInfoChar(buf, '\'');
+	for (valptr = val; *valptr; valptr++)
+	{
+		char		ch = *valptr;
+
+		if (SQL_STR_DOUBLE(ch, true))
+			appendStringInfoChar(buf, ch);
+		appendStringInfoChar(buf, ch);
+	}
+	appendStringInfoChar(buf, '\'');
+}
+#endif
 
 /*
  * Connection cache (inited on the first use)
