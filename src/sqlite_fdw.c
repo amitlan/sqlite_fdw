@@ -151,7 +151,8 @@ static bool sqliteAnalyzeForeignTable(Relation relation,
  * Helper functions
  */
 static bool sqliteIsValidOption(const char *option, Oid context);
-static void sqliteGetOptions(Oid foreigntableid, char **database, char **table);
+static void sqliteServerGetOptions(Oid foreignserverid, char **database);
+static void sqliteTableGetOptions(Oid foreigntableid, char **table);
 static int GetEstimatedRows(Oid foreigntableid);
 static bool file_exists(const char *name);
 
@@ -277,7 +278,7 @@ static const char **convert_prep_stmt_params(struct SqliteFdwModifyState *fmstat
 						 TupleTableSlot *slot);
 #endif
 
-static sqlite3 *GetConnection(Oid ftableId);
+static sqlite3 *GetConnection(Oid serverid);
 static void ReleaseConnection(sqlite3* db);
 
 Datum
@@ -425,29 +426,16 @@ sqliteIsValidOption(const char *option, Oid context)
 	return false;
 }
 
-/*
- * Fetch the options for a mysql_fdw foreign table.
- */
 static void
-sqliteGetOptions(Oid foreigntableid, char **database, char **table)
+sqliteServerGetOptions(Oid foreignserverid, char **database)
 {
-	ForeignTable   *f_table;
 	ForeignServer  *f_server;
-	List           *options;
 	ListCell       *lc;
 
-	/*
-	 * Extract options from FDW objects.
-	 */
-	f_table = GetForeignTable(foreigntableid);
-	f_server = GetForeignServer(f_table->serverid);
-
-	options = NIL;
-	options = list_concat(options, f_table->options);
-	options = list_concat(options, f_server->options);
+	f_server = GetForeignServer(foreignserverid);
 
 	/* Loop through the options */
-	foreach(lc, options)
+	foreach(lc, f_server->options)
 	{
 		DefElem *def = (DefElem *) lfirst(lc);
 
@@ -455,24 +443,46 @@ sqliteGetOptions(Oid foreigntableid, char **database, char **table)
 		{
 			*database = defGetString(def);
 		}
-
-		if (strcmp(def->defname, "table") == 0)
-		{
-			*table = defGetString(def);
-		}
-	}
-
-	if (!*table)
-	{
-		*table = get_rel_name(foreigntableid);
 	}
 
 	/* Check we have the options we need to proceed */
-	if (!*database || !*table)
+	if (!*database)
 		ereport(ERROR,
 			(errcode(ERRCODE_SYNTAX_ERROR),
-			errmsg("a database and a table must be specified")
-			));
+			errmsg("a database must be specified in server options")));
+}
+
+/*
+ * Fetch the options for a mysql_fdw foreign table.
+ */
+static void
+sqliteTableGetOptions(Oid foreigntableid, char **table)
+{
+	ForeignTable   *f_table;
+	ListCell       *lc;
+
+	/*
+	 * Extract options from FDW objects.
+	 */
+	f_table = GetForeignTable(foreigntableid);
+
+	/* Loop through the options */
+	foreach(lc, f_table->options)
+	{
+		DefElem *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "table") == 0)
+			*table = defGetString(def);
+	}
+
+	if (!*table)
+		*table = get_rel_name(foreigntableid);
+
+	/* Check we have the options we need to proceed */
+	if (!*table)
+		ereport(ERROR,
+			(errcode(ERRCODE_SYNTAX_ERROR),
+			errmsg("table name must be specified")));
 }
 
 
@@ -662,14 +672,15 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	 *
 	 */
 	SQLiteFdwExecutionState  *festate;
-	char					 *database;
-	char					 *table;
-	char                     *query;
-    size_t                   len;
+	ForeignTable   *f_table;
+	char		   *table;
+	char		   *query;
+    size_t			len;
 
 	elog(DEBUG1,"entering function %s",__func__);
 
-	sqliteGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &database, &table);
+	f_table = GetForeignTable(RelationGetRelid(node->ss.ss_currentRelation));
+	sqliteTableGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &table);
 
 	/* Build the query */
     len = strlen(table) + 15;
@@ -679,7 +690,7 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	/* Stash away the state info we have already */
 	festate = (SQLiteFdwExecutionState *) palloc(sizeof(SQLiteFdwExecutionState));
 	node->fdw_state = (void *) festate;
-	festate->conn = GetConnection(RelationGetRelid(node->ss.ss_currentRelation));
+	festate->conn = GetConnection(f_table->serverid);
 	festate->result = NULL;
 	festate->query = query;
 }
@@ -982,6 +993,7 @@ sqliteBeginForeignModify(ModifyTableState *mtstate,
 	EState	   *estate = mtstate->ps.state;
 	CmdType		operation = mtstate->operation;
 	Relation	rel = resultRelInfo->ri_RelationDesc;
+	ForeignTable *f_table;
 	AttrNumber	n_params;
 	Oid			typefnoid;
 	bool		isvarlena;
@@ -999,7 +1011,8 @@ sqliteBeginForeignModify(ModifyTableState *mtstate,
 	fmstate->rel = rel;
 
 	/* Our connection to database. */
-	fmstate->conn = GetConnection(RelationGetRelid(rel));
+	f_table = GetForeignTable(RelationGetRelid(rel));
+	fmstate->conn = GetConnection(f_table->serverid);
 
 	/* Deconstruct fdw_private data. */
 	fmstate->query = strVal(list_nth(fdw_private,
@@ -1651,6 +1664,7 @@ sqliteExplainForeignScan(ForeignScanState *node,
     int                      rc;
     const char  *pzTail;
 	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
+	ForeignTable *f_table;
 
 	elog(DEBUG1,"entering function %s",__func__);
 
@@ -1662,7 +1676,8 @@ sqliteExplainForeignScan(ForeignScanState *node,
 	}
 
 	/* Connect to the server */
-	db = GetConnection(RelationGetRelid(node->ss.ss_currentRelation));
+	f_table = GetForeignTable(RelationGetRelid(node->ss.ss_currentRelation));
+	db = GetConnection(f_table->serverid);
 
 	/* Build the query */
     len = strlen(festate->query) + 20;
@@ -1739,8 +1754,9 @@ GetEstimatedRows(Oid foreigntableid)
 {
 	sqlite3		   *db;
 	sqlite3_stmt   *result;
-	char		   *database;
+	ForeignTable   *f_table;
 	char		   *table;
+	char		   *database;
 	char		   *query;
     size_t			len;
     int				rc;
@@ -1748,10 +1764,12 @@ GetEstimatedRows(Oid foreigntableid)
 
 	int rows = 0;
 
-	sqliteGetOptions(foreigntableid, &database, &table);
+	f_table = GetForeignTable(foreigntableid);
+	sqliteTableGetOptions(foreigntableid, &table);
+	sqliteServerGetOptions(f_table->serverid, &database);
 
 	/* Connect to the server */
-	db = GetConnection(foreigntableid);
+	db = GetConnection(f_table->serverid);
 
 	/* Check that the sqlite_stat1 table exists */
 	rc = sqlite3_prepare(db, "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'", -1, &result, &pzTail);
@@ -2068,10 +2086,9 @@ begin_remote_xact(ConnCacheEntry *entry)
  * the right subtransaction nesting depth if we didn't do that already.
  */
 static sqlite3 *
-GetConnection(Oid ftableId)
+GetConnection(Oid serverid)
 {
 	bool	found;
-	ForeignTable   *f_table;
 	ConnCacheEntry *entry;
 	ConnCacheKey key;
 
@@ -2106,8 +2123,7 @@ GetConnection(Oid ftableId)
 	xact_got_connection = true;
 
 	/* Create hash key for the entry.  Assume no pad bytes in key struct */
-	f_table = GetForeignTable(ftableId);
-	key = f_table->serverid;
+	key = serverid;
 
 	/*
 	 * Find or create cached entry for requested connection.
@@ -2138,9 +2154,8 @@ GetConnection(Oid ftableId)
 	{
 		sqlite3 *db;
 		char   *database = NULL;
-		char   *table = NULL;
 
-		sqliteGetOptions(ftableId, &database, &table);
+		sqliteServerGetOptions(serverid, &database);
 		if (sqlite3_open(database, &db))
 			ereport(ERROR,
 				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
