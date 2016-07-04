@@ -204,12 +204,12 @@ typedef struct
  * FDW-specific information for ForeignScanState.fdw_state.
  */
 
-typedef struct SQLiteFdwExecutionState
+typedef struct SqliteFdwScanState
 {
 	sqlite3       *conn;
 	sqlite3_stmt  *result;
 	char          *query;
-} SQLiteFdwExecutionState;
+} SqliteFdwScanState;
 
 /*
  * Execution state of a foreign insert operation.
@@ -671,7 +671,7 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	 * ExplainForeignScan and EndForeignScan.
 	 *
 	 */
-	SQLiteFdwExecutionState  *festate;
+	SqliteFdwScanState  *festate;
 	ForeignTable   *f_table;
 	char		   *table;
 	char		   *query;
@@ -688,7 +688,7 @@ sqliteBeginForeignScan(ForeignScanState *node,
     snprintf(query, len, "SELECT * FROM %s", table);
 
 	/* Stash away the state info we have already */
-	festate = (SQLiteFdwExecutionState *) palloc(sizeof(SQLiteFdwExecutionState));
+	festate = (SqliteFdwScanState *) palloc(sizeof(SqliteFdwScanState));
 	node->fdw_state = (void *) festate;
 	festate->conn = GetConnection(f_table->serverid);
 	festate->result = NULL;
@@ -729,7 +729,7 @@ sqliteIterateForeignScan(ForeignScanState *node)
     const char  *pzTail;
     int         rc;
 
-	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
+	SqliteFdwScanState *festate = (SqliteFdwScanState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 
 	/* Execute the query, if required */
@@ -791,7 +791,7 @@ sqliteEndForeignScan(ForeignScanState *node)
 	 * remote servers should be cleaned up.
 	 */
 
-	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
+	SqliteFdwScanState *festate = (SqliteFdwScanState *) node->fdw_state;
 
 	elog(DEBUG1,"entering function %s",__func__);
 
@@ -1663,7 +1663,7 @@ sqliteExplainForeignScan(ForeignScanState *node,
     size_t                   len;
     int                      rc;
     const char  *pzTail;
-	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
+	SqliteFdwScanState *festate = (SqliteFdwScanState *) node->fdw_state;
 	ForeignTable *f_table;
 
 	elog(DEBUG1,"entering function %s",__func__);
